@@ -19,6 +19,7 @@ char *argv0;
 #include "arg.h"
 #include "st.h"
 #include "win.h"
+#include "hb.h"
 
 /* types used in config.h */
 typedef struct {
@@ -157,6 +158,7 @@ static void xhints(void);
 static int xloadcolor(int, const char *, Color *);
 static int xloadfont(Font *, FcPattern *);
 static void xloadfonts(const char *, double);
+static void xloadsparefont();
 static void xunloadfont(Font *);
 static void xunloadfonts(void);
 static void xsetenv(void);
@@ -306,6 +308,7 @@ zoomabs(const Arg *arg)
 {
 	xunloadfonts();
 	xloadfonts(usedfont, arg->f);
+	xloadsparefont();
 	cresize(0, 0);
 	redraw();
 	xhints();
@@ -1051,6 +1054,67 @@ xloadfonts(const char *fontstr, double fontsize)
 }
 
 void
+xloadsparefont()
+{
+	FcPattern *fontpattern, *match;
+	FcResult result;
+
+	/* add font2 to font cache as first 4 entries */
+	if ( font2[0] == '-' )
+		fontpattern = XftXlfdParse(font2, False, False);
+	else
+		fontpattern = FcNameParse((FcChar8 *)font2);
+	if ( fontpattern ) {
+		/* Allocate memory for the new cache entries. */
+		frccap += 4;
+		frc = xrealloc(frc, frccap * sizeof(Fontcache));
+		/* add Normal */
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match ) 
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_NORMAL;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		/* add Italic */
+		FcPatternDel(fontpattern, FC_SLANT);
+		FcPatternAddInteger(fontpattern, FC_SLANT, FC_SLANT_ITALIC);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_ITALIC;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		/* add Italic Bold */
+		FcPatternDel(fontpattern, FC_WEIGHT);
+		FcPatternAddInteger(fontpattern, FC_WEIGHT, FC_WEIGHT_BOLD);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_ITALICBOLD;
+				frclen++;
+			} else 
+				FcPatternDestroy(match);
+		/* add Bold */
+		FcPatternDel(fontpattern, FC_SLANT);
+		FcPatternAddInteger(fontpattern, FC_SLANT, FC_SLANT_ROMAN);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_BOLD;
+				frclen++;
+			} else 
+				FcPatternDestroy(match);
+		FcPatternDestroy(fontpattern);
+	}
+}
+
+void
 xunloadfont(Font *f)
 {
 	XftFontClose(xw.dpy, f->match);
@@ -1062,6 +1126,9 @@ xunloadfont(Font *f)
 void
 xunloadfonts(void)
 {
+	/* Clear Harfbuzz font cache. */
+	hbunloadfonts();
+
 	/* Free the loaded fonts in the font cache.  */
 	while (frclen > 0)
 		XftFontClose(xw.dpy, frc[--frclen].font);
@@ -1146,6 +1213,9 @@ xinit(int cols, int rows)
 
 	usedfont = (opt_font == NULL)? font : opt_font;
 	xloadfonts(usedfont, 0);
+
+	/* spare font (font2) */
+	xloadsparefont();
 
 	/* colors */
 	xw.cmap = XDefaultColormap(xw.dpy, xw.scr);
@@ -1261,7 +1331,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		mode = glyphs[i].mode;
 
 		/* Skip dummy wide-character spacing. */
-		if (mode == ATTR_WDUMMY)
+		if (mode & ATTR_WDUMMY)
 			continue;
 
 		/* Determine font for glyph if different from previous glyph. */
@@ -1367,6 +1437,9 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		xp += runewidth;
 		numspecs++;
 	}
+
+	/* Harfbuzz transformation for ligatures. */
+	hbtransform(specs, glyphs, len, x, y);
 
 	return numspecs;
 }
@@ -1517,14 +1590,17 @@ xdrawglyph(Glyph g, int x, int y)
 }
 
 void
-xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
+xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og, Line line, int len)
 {
 	Color drawcol;
 
 	/* remove the old cursor */
 	if (selected(ox, oy))
 		og.mode ^= ATTR_REVERSE;
-	xdrawglyph(og, ox, oy);
+
+	/* Redraw the line where cursor was previously.
+	 * It will restore the ligatures broken by the cursor. */
+	xdrawline(line, 0, oy, len);
 
 	if (IS_SET(MODE_HIDE))
 		return;
